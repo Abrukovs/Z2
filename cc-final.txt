@@ -1,0 +1,19 @@
+Remaining: 44 picks
+7:23:41 PM Phoenix Mercury vs Connecticut Sun: agree (conf=70)
+7:23:53 PM Boston Red Sox vs Tampa Bay Rays: agree (conf=60)
+7:24:18 PM New York Yankees vs Los Angeles Dodgers:   HTTP 429
+SKIP
+7:24:31 PM France vs England:   HTTP 429
+SKIP
+7:24:44 PM Indiana Fever vs New York Liberty:   HTTP 429
+SKIP
+7:24:57 PM Chicago Cubs vs Minnesota Twins:   HTTP 429
+SKIP
+7:25:10 PM Minnesota Lynx vs Portland Fire:   HTTP 429
+SKIP
+7:25:23 PM New York Yankees vs Los Angeles Dodgers:   HTTP 429
+SKIP
+7:25:37 PM Golden State Valkyries vs Washington Mystics:   HTTP 429
+SKIP
+7:25:50 PM Atlanta Dream vs Chicago Sky:   HTTP 429
+SKIP

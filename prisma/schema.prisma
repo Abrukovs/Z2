@@ -1,0 +1,95 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Looking for ways to speed up your queries, or scale easily with your serverless or edge functions?
+// Try Prisma Accelerate: https://pris.ly/cli/accelerate-init
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  name      String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Post {
+  id        String   @id @default(cuid())
+  title     String
+  content   String?
+  published Boolean  @default(false)
+  authorId  String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// Сохранённые пики для ведения статистики (ROI, win rate).
+// result: 'pending' (матч ещё не начался/не проверен) | 'won' | 'lost' | 'push' | 'no_result'
+model StoredPick {
+  id              String   @id
+  sportKey        String
+  sport           String
+  league          String
+  team1           String
+  team2           String
+  startTime       String
+  market          String
+  selection       String
+  odds            String
+  confidence      String
+  confidenceScore Int
+  dataSource      String
+  pickDate        String   // YYYY-MM-DD дата, на которую сгенерирован пик
+  createdAt       DateTime @default(now())
+
+  // ===== Анализ и источник (чтобы пик не был "пустым" при загрузке из БД) =====
+  reasoning       String?  // анализ ИИ (почему этот пик)
+  risk            String?  // примечание о риске
+  sourceQuote     String?  // точная цитата из источника (для верификации матча)
+  sourceUrl       String?  // URL источника
+  sourceName      String?  // host источника (espn.com, atptour.com, и т.д.)
+
+  // Результат (заполняется автоматически после матча)
+  result          String   @default("pending")
+  homeScore       Int?
+  awayScore       Int?
+  resultCheckedAt DateTime?
+
+  // ===== Cross-check (второе мнение от Nemotron через OpenRouter) =====
+  // Заполняется после cross-check. Может быть null — пики до внедрения cross-check.
+  crossCheckedAt  DateTime?   // когда выполнялся cross-check
+  crossCheckModel String?     // какая модель (nvidia/nemotron-3-ultra-550b-a55b:free, ...)
+  crossCheckAgree String?     // 'agree' | 'disagree' — согласна ли вторая модель с пиком
+  crossCheckConfidence Int?   // 0-100 — уверенность второй модели
+  crossCheckReasoning String? // краткое обоснование второй модели (по-русски)
+  crossCheckScore  Int?       // итоговый скор с учётом cross-check (confidenceScore ± корректировка)
+
+  @@index([pickDate])
+  @@index([result])
+  @@index([sportKey])
+  @@index([crossCheckAgree])
+}
+
+// Журнал ошибок — для отслеживания повторяющихся проблем
+model ErrorLog {
+  id          Int      @id @default(autoincrement())
+  createdAt   DateTime @default(now())
+  date        String   // YYYY-MM-DD — дата ошибки
+  category    String   // 'picks' | 'cross-check' | 'validation' | 'server' | 'data'
+  severity    String   @default("warning") // 'info' | 'warning' | 'error'
+  message     String   // краткое описание
+  details     String?  // подробности (stack trace, контекст)
+  resolved    Boolean  @default(false)
+
+  @@index([date])
+  @@index([category])
+  @@index([resolved])
+}

@@ -1,0 +1,1286 @@
+     1→import ZAI from 'z-ai-web-dev-sdk';
+     2→import {
+     3→  getTodayEventsFromApi,
+     4→  filterUpcoming,
+     5→  type SportsEvent,
+     6→} from './sports-data';
+     7→import {
+     8→  getVolleyballEvents,
+     9→  filterUpcomingVolleyball,
+    10→  type VolleyballEvent,
+    11→} from './volleyball-data';
+    12→import { savePicksToDb } from './stats-service';
+    13→
+    14→export type Confidence = 'low' | 'medium' | 'high';
+    15→
+    16→export interface Pick {
+    17→  id: string;
+    18→  sport: string;       // Человекочитаемое название (Футбол)
+    19→  sportKey: string;    // Ключ (football)
+    20→  sportIcon: string;   // Эмодзи
+    21→  league: string;
+    22→  team1: string;
+    23→  team2: string;
+    24→  startTime: string;   // HH:MM
+    25→  market: string;      // Рынок (Победа 1, Тотал, Обе забьют ...)
+    26→  selection: string;   // Конкретная рекомендация
+    27→  odds: string;        // Коэффициент, напр. "1.85"
+    28→  confidence: Confidence;
+    29→  confidenceScore: number; // 0-100
+    30→  reasoning: string;   // Анализ
+    31→  risk: string;        // Примечание о риске
+    32→  sourceQuote: string; // Точная цитата из источника, доказывающая реальность матча
+    33→  sourceUrl: string;   // URL источника
+    34→  sourceName: string;  // Название источника (host)
+    35→  dataSource: string;  // 'ESPN API' | 'Веб-поиск' — источник расписания
+    36→  generatedAt: string; // ISO timestamp генерации
+    37→}
+    38→
+    39→interface CacheEntry {
+    40→  picks: Pick[];
+    41→  ts: number;
+    42→}
+    43→
+    44→const cache = new Map<string, CacheEntry>();
+    45→const CACHE_TTL = 24 * 60 * 60 * 1000; // 24 часа — пики стабильны весь день, кэш-ключ привязан к дате
+    46→
+    47→// ====== СЧЁТЧИК API-ЗАПРОСОВ (in-memory, за время работы процесса) ======
+    48→interface UsageStats {
+    49→  webSearchCalls: number;
+    50→  llmCalls: number;
+    51→  totalCalls: number;
+    52→  cacheHits: number;
+    53→  generations: number;
+    54→  sessionStart: string;
+    55→  lastCallAt: string | null;
+    56→}
+    57→
+    58→const usage: UsageStats = {
+    59→  webSearchCalls: 0,
+    60→  llmCalls: 0,
+    61→  totalCalls: 0,
+    62→  cacheHits: 0,
+    63→  generations: 0,
+    64→  sessionStart: new Date().toISOString(),
+    65→  lastCallAt: null,
+    66→};
+    67→
+    68→function bumpWebSearch(n = 1) {
+    69→  usage.webSearchCalls += n;
+    70→  usage.totalCalls += n;
+    71→  usage.lastCallAt = new Date().toISOString();
+    72→}
+    73→
+    74→function bumpLLM() {
+    75→  usage.llmCalls += 1;
+    76→  usage.totalCalls += 1;
+    77→  usage.lastCallAt = new Date().toISOString();
+    78→}
+    79→
+    80→export function getUsage() {
+    81→  return { ...usage };
+    82→}
+    83→
+    84→// ====== СЕЗОННОСТЬ ТУРНИРОВ ======
+    85→// Активные турниры по месяцам (для отсева неактивных лиг).
+    86→// Ключ — номер месяца 1-12.
+    87→export interface ActiveLeagues {
+    88→  football: string[];
+    89→  basketball: string[];
+    90→  tennis: string[];
+    91→  hockey: string[];
+    92→  esports: string[];
+    93→  volleyball: string[];
+    94→  baseball: string[];
+    95→}
+    96→
+    97→const SEASONAL_LEAGUES: Record<number, ActiveLeagues> = {
+    98→  1: {
+    99→    football: ['АПЛ', 'Ла Лига', 'Серия А', 'Бундеслига', 'РПЛ', 'Лига чемпионов УЕФА', 'Лига Европы УЕФА', 'Кубок Африканских Наций'],
+   100→    basketball: ['НБА', 'Евролига', 'Единая лига ВТБ'],
+   101→    tennis: ['Australian Open', 'ATP', 'WTA'],
+   102→    hockey: ['НХЛ', 'КХЛ'],
+   103→    esports: ['LCK', 'LPL', 'LEC', 'LCS', 'CS2 ESL Pro League', 'Dota 2 DPC'],
+   104→    volleyball: [],
+   105→  },
+   106→  2: {
+   107→    football: ['АПЛ', 'Ла Лига', 'Серия А', 'Бундеслига', 'РПЛ', 'Лига чемпионов УЕФА', 'Лига Европы УЕФА'],
+   108→    basketball: ['НБА', 'Евролига', 'Единая лига ВТБ'],
+   109→    tennis: ['ATP', 'WTA'],
+   110→    hockey: ['НХЛ', 'КХЛ'],
+   111→    esports: ['IEM Katowice', 'LCK', 'LPL', 'LEC', 'LCS', 'CS2'],
+   112→    volleyball: [],
+   113→  },
+   114→  3: {
+   115→    football: ['АПЛ', 'Ла Лига', 'Серия А', 'Бундеслига', 'РПЛ', 'Лига чемпионов УЕФА', 'Лига Европы УЕФА', 'Лига наций УЕФА'],
+   116→    basketball: ['НБА', 'Евролига', 'Единая лига ВТБ'],
+   117→    tennis: ['ATP', 'WTA', 'Miami Open'],
+   118→    hockey: ['НХЛ', 'КХЛ'],
+   119→    esports: ['CS2 Major', 'LCK', 'LPL', 'LEC', 'LCS'],
+   120→    volleyball: [],
+   121→  },
+   122→  4: {
+   123→    football: ['АПЛ', 'Ла Лига', 'Серия А', 'Бундеслига', 'РПЛ', 'Лига чемпионов УЕФА', 'Лига Европы УЕФА'],
+   124→    basketball: ['НБА', 'Евролига', 'Единая лига ВТБ'],
+   125→    tennis: ['ATP', 'WTA', 'Мастерс Монте-Карло'],
+   126→    hockey: ['НХЛ', 'КХЛ', 'Кубок Гагарина'],
+   127→    esports: ['LCK Spring Playoffs', 'LPL Spring Playoffs', 'CS2 ESL Pro League', 'VCT'],
+   128→    volleyball: [],
+   129→  },
+   130→  5: {
+   131→    football: ['АПЛ', 'Ла Лига', 'Серия А', 'Бундеслига', 'РПЛ', 'Лига чемпионов УЕФА', 'Лига Европы УЕФА', 'Лига конференций УЕФА'],
+   132→    basketball: ['НБА', 'Евролига', 'Единая лига ВТБ'],
+   133→    tennis: ['ATP', 'WTA', 'Roland Garros'],
+   134→    hockey: ['НХЛ', 'Кубок Гагарина', 'Чемпионат мира'],
+   135→    esports: ['LoL MSI', 'Dota 2 ESL One', 'LCK', 'LPL', 'CS2'],
+   136→    volleyball: ['Лига наций', 'Лига наций волейбол', 'Волейбольная лига наций'],
+   137→  },
+   138→  6: {
+   139→    football: ['Лига чемпионов УЕФА', 'Лига Европы УЕФА', 'MLS', 'Бразилейрано', 'Лига наций УЕФА'],
+   140→    basketball: ['НБА', 'WNBA', 'Летняя лига НБА'],
+   141→    tennis: ['ATP', 'WTA', 'Уимблдон квалификация', 'Roland Garros'],
+   142→    hockey: ['НХЛ', 'Чемпионат мира'],
+   143→    esports: ['Dota 2 Riyadh Masters', 'LoL Summer Split', 'CS2 ESL Pro League', 'LCK', 'LPL'],
+   144→    volleyball: ['Лига наций', 'Лига наций волейбол', 'Волейбольная лига наций'],
+   145→  },
+   146→  7: {
+   147→    football: ['MLS', 'Бразилейрано', 'Лига наций УЕФА', 'Лига чемпионов УЕФА квалификация', 'Товарищеские матчи сборных', 'Кубок Либертадорес', 'Кубок АФК'],
+   148→    basketball: ['WNBA', 'Летняя лига НБА'],
+   149→    tennis: ['Уимблдон', 'ATP', 'WTA'],
+   150→    hockey: [], // Июль — межсезонье для большинства хоккейных лиг
+   151→    esports: ['IEM Cologne', 'LoL Summer Split', 'LCK', 'LPL', 'Dota 2', 'CS2'],
+   152→    volleyball: ['Лига наций', 'Лига наций волейбол', 'Волейбольная лига наций'],
+   153→  },
+   154→  8: {
+   155→    football: ['АПЛ', 'Ла Лига', 'Серия А', 'Бундеслига', 'РПЛ', 'MLS', 'Бразилейрано', 'Лига чемпионов УЕФА квалификация', 'Лига наций УЕФА'],
+   156→    basketball: ['WNBA', 'Евролига квалификация', 'Чемпионат Европы'],
+   157→    tennis: ['US Open', 'ATP', 'WTA', 'Cincinnati Masters'],
+   158→    hockey: [], // Межсезонье
+   159→    esports: ['IEM Cologne', 'EVO', 'Valorant Champions', 'LoL Summer Split', 'LCK Playoffs'],
+   160→    volleyball: [],
+   161→  },
+   162→  9: {
+   163→    football: ['АПЛ', 'Ла Лига', 'Серия А', 'Бундеслига', 'РПЛ', 'Лига чемпионов УЕФА', 'Лига Европы УЕФА', 'MLS'],
+   164→    basketball: ['НБА предсезонка', 'Евролига', 'Единая лига ВТБ'],
+   165→    tennis: ['US Open', 'ATP', 'WTA'],
+   166→    hockey: ['НХЛ предсезонка', 'КХЛ'],
+   167→    esports: ['LoL Worlds', 'CS2 Major', 'Dota 2 The International', 'LCK'],
+   168→    volleyball: ['Чемпионат России по волейболу', 'Лига чемпионов ЕКВ'],
+   169→  },
+   170→  10: {
+   171→    football: ['АПЛ', 'Ла Лига', 'Серия А', 'Бундеслига', 'РПЛ', 'Лига чемпионов УЕФА', 'Лига Европы УЕФА', 'MLS'],
+   172→    basketball: ['НБА', 'Евролига', 'Единая лига ВТБ'],
+   173→    tennis: ['ATP', 'WTA', 'Shanghai Masters'],
+   174→    hockey: ['НХЛ', 'КХЛ'],
+   175→    esports: ['LoL Worlds', 'CS2 Major', 'Dota 2 The International'],
+   176→    volleyball: ['Чемпионат России по волейболу', 'Лига чемпионов ЕКВ'],
+   177→  },
+   178→  11: {
+   179→    football: ['АПЛ', 'Ла Лига', 'Серия А', 'Бундеслига', 'РПЛ', 'Лига чемпионов УЕФА', 'Лига Европы УЕФА', 'MLS'],
+   180→    basketball: ['НБА', 'Евролига', 'Единая лига ВТБ'],
+   181→    tennis: ['ATP Finals', 'WTA Finals', 'ATP', 'WTA'],
+   182→    hockey: ['НХЛ', 'КХЛ'],
+   183→    esports: ['LoL Worlds Finals', 'BLAST Premier', 'LCK'],
+   184→    volleyball: ['Чемпионат России по волейболу', 'Лига чемпионов ЕКВ'],
+   185→  },
+   186→  12: {
+   187→    football: ['АПЛ', 'Ла Лига', 'Серия А', 'Бундеслига', 'РПЛ', 'Лига чемпионов УЕФА', 'Лига Европы УЕФА'],
+   188→    basketball: ['НБА', 'Евролига', 'Единая лига ВТБ'],
+   189→    tennis: ['ATP', 'WTA'],
+   190→    hockey: ['НХЛ', 'КХЛ'],
+   191→    esports: ['BLAST Premier World Final', 'Dota 2 ESL One', 'LCK'],
+   192→    volleyball: ['Чемпионат России по волейболу', 'Лига чемпионов ЕКВ'],
+   193→  },
+   194→};
+   195→
+   196→// ====== ГОДО-ЗАВИСИМЫЕ ТУРНИРЫ (раз в 4 года) ======
+   197→// ЧМ по футболу, Евро, Копа Америка — не каждый год. Добавляем только в годы проведения.
+   198→function getSpecialEvents(year: number, month: number): ActiveLeagues {
+   199→  const special: ActiveLeagues = {
+   200→    football: [],
+   201→    basketball: [],
+   202→    tennis: [],
+   203→    hockey: [],
+   204→    esports: [],
+   205→  };
+   206→  const isSummer = month === 6 || month === 7;
+   207→
+   208→  // Чемпионат мира по футболу FIFA: 2022, 2026, 2030 (июнь-июль)
+   209→  if (isSummer && [2022, 2026, 2030, 2034].includes(year)) {
+   210→    special.football.push(
+   211→      'Чемпионат мира по футболу',
+   212→      'ЧМ по футболу',
+   213→      'FIFA World Cup',
+   214→      'ЧМ-' + year,
+   215→    );
+   216→  }
+   217→  // Евро УЕФА: 2024, 2028, 2032 (июнь-июль)
+   218→  if (isSummer && [2024, 2028, 2032].includes(year)) {
+   219→    special.football.push('Чемпионат Европы', 'Евро УЕФА', 'Евро-' + year);
+   220→  }
+   221→  // Копа Америка: 2024, 2028 (июнь-июль)
+   222→  if (isSummer && [2024, 2028].includes(year)) {
+   223→    special.football.push('Копа Америка', 'Copa America');
+   224→  }
+   225→  return special;
+   226→}
+   227→
+   228→function getActiveLeagues(year: number, month: number): ActiveLeagues {
+   229→  const base =
+   230→    SEASONAL_LEAGUES[month] || {
+   231→      football: [] as string[],
+   232→      basketball: [] as string[],
+   233→      tennis: [] as string[],
+   234→      hockey: [] as string[],
+   235→      esports: [] as string[],
+   236→      volleyball: [] as string[],
+   237→      baseball: [] as string[],
+   238→    };
+   239→  const special = getSpecialEvents(year, month);
+   240→  // MLB сезон: апрель-октябрь (включая All-Star Game в июле)
+   241→  const mlbSeason = month >= 4 && month <= 10;
+   242→  return {
+   243→    football: [...base.football, ...special.football],
+   244→    basketball: [...base.basketball, ...special.basketball],
+   245→    tennis: [...base.tennis, ...special.tennis],
+   246→    hockey: [...base.hockey, ...special.hockey],
+   247→    esports: [...base.esports, ...special.esports],
+   248→    volleyball: base.volleyball || [],
+   249→    baseball: mlbSeason ? ['MLB'] : [],
+   250→  };
+   251→}
+   252→
+   253→// Проверка: относится ли строка лиги к разрешённым в текущем месяце.
+   254→function isLeagueAllowed(leagueName: string, allowed: string[]): boolean {
+   255→  if (allowed.length === 0) return false; // нет активных лиг → всё запрещено
+   256→  const lower = (leagueName || '').toLowerCase();
+   257→  return allowed.some((a) => lower.includes(a.toLowerCase()));
+   258→}
+   259→
+   260→// Какой турнир Большого шлема идёт сейчас?
+   261→// Учитывает конкретные даты проведения, а не только месяц.
+   262→// Возвращает имя для поискового запроса или null.
+   263→function getActiveGrandSlam(
+   264→  year: number,
+   265→  month: number,
+   266→  day: number,
+   267→): string | null {
+   268→  // Australian Open: 12-26 января
+   269→  if (month === 1 && day >= 12 && day <= 27) return 'Australian Open';
+   270→  // Roland Garros: 25 мая - 8 июня
+   271→  if ((month === 5 && day >= 25) || (month === 6 && day <= 9))
+   272→    return 'Roland Garros';
+   273→  // Уимблдон: 29 июня - 12 июля
+   274→  if ((month === 6 && day >= 29) || (month === 7 && day <= 12)) return 'Уимблдон';
+   275→  // US Open: 25 августа - 13 сентября
+   276→  if ((month === 8 && day >= 25) || (month === 9 && day <= 14)) return 'US Open';
+   277→  return null;
+   278→}
+   279→
+   280→// Виды спорта для ежедневного покрытия.
+   281→// todayDate подставляется динамически; список лиг фильтруется по месяцу и году.
+   282→// Запросы сфокусированы на расписании конкретного дня, чтобы веб-поиск
+   283→// возвращал свежие данные, а не общие обзоры турниров.
+   284→function buildSports(
+   285→  todayDate: string,
+   286→  year: number,
+   287→  month: number,
+   288→  day: number,
+   289→): { key: string; label: string; icon: string; query: string }[] {
+   290→  const active = getActiveLeagues(year, month);
+   291→  const leaguesStr = (arr: string[]) => arr.join(' ');
+   292→  const sports: { key: string; label: string; icon: string; query: string }[] =
+   293→    [];
+   294→
+   295→  // ЧМ по футболу идёт? Делаем отдельный усиленный запрос для расписания ЧМ.
+   296→  const isWorldCupYear = [2022, 2026, 2030, 2034].includes(year);
+   297→  const isWorldCupMonth = month === 6 || month === 7;
+   298→  if (isWorldCupYear && isWorldCupMonth) {
+   299→    sports.push({
+   300→      key: 'football',
+   301→      label: 'Футбол',
+   302→      icon: '⚽',
+   303→      query: `чемпионат мира 2026 футбол расписание матчей ${todayDate} сегодня кто играет время начала 1/16 финала`,
+   304→    });
+   305→  }
+   306→
+   307→  if (active.football.length) {
+   308→    sports.push({
+   309→      key: 'football',
+   310→      label: 'Футбол',
+   311→      icon: '⚽',
+   312→      query: `расписание футбол матчей ${todayDate} сегодня кто играет время начала ${leaguesStr(active.football)}`,
+   313→    });
+   314→  }
+   315→  if (active.basketball.length) {
+   316→    sports.push({
+   317→      key: 'basketball',
+   318→      label: 'Баскетбол',
+   319→      icon: '🏀',
+   320→      query: `расписание баскетбол матчей ${todayDate} сегодня кто играет время ${leaguesStr(active.basketball)}`,
+   321→    });
+   322→  }
+   323→  // Турнир Большого шлема идёт? Делаем отдельный усиленный запрос.
+   324→  // БШ-турниры: Australian Open (январь), Roland Garros (май-июнь),
+   325→  // Уимблдон (июнь-июль), US Open (август-сентябрь).
+   326→  const slamName = getActiveGrandSlam(year, month, day);
+   327→  if (slamName) {
+   328→    sports.push({
+   329→      key: 'tennis',
+   330→      label: 'Теннис',
+   331→      icon: '🎾',
+   332→      query: `${slamName} 2026 расписание матчей ${todayDate} сегодня кто играет время начала сетка`,
+   333→    });
+   334→  }
+   335→
+   336→  if (active.tennis.length) {
+   337→    sports.push({
+   338→      key: 'tennis',
+   339→      label: 'Теннис',
+   340→      icon: '🎾',
+   341→      query: `расписание теннис матчей ${todayDate} сегодня кто играет сетка турнира ${leaguesStr(active.tennis)}`,
+   342→    });
+   343→  }
+   344→  if (active.hockey.length) {
+   345→    sports.push({
+   346→      key: 'hockey',
+   347→      label: 'Хоккей',
+   348→      icon: '🏒',
+   349→      query: `расписание хоккей матчей ${todayDate} сегодня кто играет время начала ${leaguesStr(active.hockey)}`,
+   350→    });
+   351→  }
+   352→  if (active.esports.length) {
+   353→    sports.push({
+   354→      key: 'esports',
+   355→      label: 'Киберспорт',
+   356→      icon: '🎮',
+   357→      query: `расписание киберспорт матчей ${todayDate} сегодня кто играет CS2 Dota 2 LoL Valorant ${leaguesStr(active.esports)}`,
+   358→    });
+   359→  }
+   360→  if (active.volleyball.length) {
+   361→    sports.push({
+   362→      key: 'volleyball',
+   363→      label: 'Волейбол',
+   364→      icon: '🏐',
+   365→      query: `расписание волейбол матчей ${todayDate} сегодня кто играет время начала ${leaguesStr(active.volleyball)}`,
+   366→    });
+   367→  }
+   368→  return sports;
+   369→}
+   370→
+   371→const SPORT_MAP: Record<string, { label: string; icon: string; key: string }> = {
+   372→  футбол: { label: 'Футбол', icon: '⚽', key: 'football' },
+   373→  football: { label: 'Футбол', icon: '⚽', key: 'football' },
+   374→  soccer: { label: 'Футбол', icon: '⚽', key: 'football' },
+   375→  баскетбол: { label: 'Баскетбол', icon: '🏀', key: 'basketball' },
+   376→  basketball: { label: 'Баскетбол', icon: '🏀', key: 'basketball' },
+   377→  теннис: { label: 'Теннис', icon: '🎾', key: 'tennis' },
+   378→  tennis: { label: 'Теннис', icon: '🎾', key: 'tennis' },
+   379→  хоккей: { label: 'Хоккей', icon: '🏒', key: 'hockey' },
+   380→  hockey: { label: 'Хоккей', icon: '🏒', key: 'hockey' },
+   381→  киберспорт: { label: 'Киберспорт', icon: '🎮', key: 'esports' },
+   382→  esports: { label: 'Киберспорт', icon: '🎮', key: 'esports' },
+   383→  'киберспорт (cs2)': { label: 'Киберспорт', icon: '🎮', key: 'esports' },
+   384→  бейсбол: { label: 'Бейсбол', icon: '⚾', key: 'baseball' },
+   385→  baseball: { label: 'Бейсбол', icon: '⚾', key: 'baseball' },
+   386→  волейбол: { label: 'Волейбол', icon: '🏐', key: 'volleyball' },
+   387→  volleyball: { label: 'Волейбол', icon: '🏐', key: 'volleyball' },
+   388→};
+   389→
+   390→function sportMeta(label: string, fallbackKey: string) {
+   391→  const norm = (label || '').trim().toLowerCase();
+   392→  const found = SPORT_MAP[norm];
+   393→  if (found) {
+   394→    return { label: found.label, icon: found.icon, key: found.key };
+   395→  }
+   396→  // fallback: найти по частичному совпадению
+   397→  const partial = Object.values(SPORT_MAP).find((m) =>
+   398→    norm.includes(m.label.toLowerCase()),
+   399→  );
+   400→  if (partial) {
+   401→    return {
+   402→      label: partial.label,
+   403→      icon: partial.icon,
+   404→      key: partial.key,
+   405→    };
+   406→  }
+   407→  return { label: label || 'Спорт', icon: '🏆', key: fallbackKey };
+   408→}
+   409→
+   410→interface RawPick {
+   411→  sport?: string;
+   412→  league?: string;
+   413→  team1?: string;
+   414→  team2?: string;
+   415→  time?: string;
+   416→  market?: string;
+   417→  selection?: string;
+   418→  odds?: number | string;
+   419→  confidence?: string;
+   420→  confidenceScore?: number;
+   421→  reasoning?: string;
+   422→  risk?: string;
+   423→  sourceQuote?: string;
+   424→  sourceUrl?: string;
+   425→  sourceName?: string;
+   426→  dataSource?: string;
+   427→}
+   428→
+   429→// Создать детерминированный ID пика на основе матча.
+   430→// Один и тот же матч (sport+teams+time+date) всегда даёт один и тот же ID,
+   431→// чтобы повторные генерации не создавали дубликаты в БД статистики.
+   432→function makePickId(
+   433→  sportKey: string,
+   434→  team1: string,
+   435→  team2: string,
+   436→  startTime: string,
+   437→  pickDate = '',
+   438→): string {
+   439→  const slug = (s: string) =>
+   440→    s
+   441→      .toLowerCase()
+   442→      .replace(/[^a-zа-яё0-9]/gi, '')
+   443→      .slice(0, 12);
+   444→  const t1 = slug(team1);
+   445→  const t2 = slug(team2);
+   446→  const t = (startTime || '').replace(/[^0-9]/g, '');
+   447→  return `pick-${pickDate}-${sportKey}-${t1}-${t2}-${t}`;
+   448→}
+   449→
+   450→function parsePicks(content: string, generatedAt: string, pickDate = ''): Pick[] {
+   451→  let text = content.trim();
+   452→
+   453→  // Убираем markdown-ограждения
+   454→  const fence = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+   455→  if (fence) {
+   456→    text = fence[1].trim();
+   457→  }
+   458→
+   459→  // Извлекаем первый JSON-массив
+   460→  const start = text.indexOf('[');
+   461→  const end = text.lastIndexOf(']');
+   462→  if (start !== -1 && end !== -1 && end > start) {
+   463→    text = text.slice(start, end + 1);
+   464→  }
+   465→
+   466→  let arr: unknown;
+   467→  try {
+   468→    arr = JSON.parse(text);
+   469→  } catch {
+   470→    return [];
+   471→  }
+   472→
+   473→  if (!Array.isArray(arr)) return [];
+   474→
+   475→  const picks: Pick[] = arr
+   476→    .map((item, idx): Pick | null => {
+   477→      const r = item as RawPick;
+   478→      if (!r || typeof r !== 'object') return null;
+   479→      if (!r.team1 || !r.team2) return null;
+   480→
+   481→      const sportLabel = r.sport || 'Спорт';
+   482→      const meta = sportMeta(sportLabel, `sport-${idx}`);
+   483→      const conf = normalizeConfidence(r.confidence);
+   484→      const score = normalizeScore(r.confidenceScore, conf);
+   485→
+   486→      return {
+   487→        id: makePickId(meta.key, String(r.team1 || ''), String(r.team2 || ''), normalizeTime(r.time), pickDate),
+   488→        sport: meta.label,
+   489→        sportKey: meta.key,
+   490→        sportIcon: meta.icon,
+   491→        league: r.league || '—',
+   492→        team1: String(r.team1).trim(),
+   493→        team2: String(r.team2).trim(),
+   494→        startTime: normalizeTime(r.time),
+   495→        market: r.market || 'Исход матча',
+   496→        selection: r.selection || '—',
+   497→        odds: normalizeOdds(r.odds),
+   498→        confidence: conf,
+   499→        confidenceScore: score,
+   500→        reasoning: (r.reasoning || '').trim(),
+   501→        risk: (r.risk || '').trim(),
+   502→        sourceQuote: (r.sourceQuote || '').trim(),
+   503→        sourceUrl: (r.sourceUrl || '').trim(),
+   504→        sourceName: (r.sourceName || '').trim(),
+   505→        dataSource: (r.dataSource || 'Веб-поиск').trim(),
+   506→        generatedAt,
+   507→      };
+   508→    })
+   509→    .filter((p): p is Pick => p !== null);
+   510→
+   511→  return picks;
+   512→}
+   513→
+   514→function normalizeConfidence(v?: string): Confidence {
+   515→  const s = (v || '').toLowerCase().trim();
+   516→  if (s.startsWith('high') || s.startsWith('выс') || s === 'высокая')
+   517→    return 'high';
+   518→  if (s.startsWith('low') || s.startsWith('низ') || s === 'низкая')
+   519→    return 'low';
+   520→  return 'medium';
+   521→}
+   522→
+   523→function normalizeScore(v: unknown, conf: Confidence): number {
+   524→  let n = typeof v === 'number' ? v : parseFloat(String(v ?? ''));
+   525→  if (!isFinite(n) || n <= 0) {
+   526→    n = conf === 'high' ? 82 : conf === 'medium' ? 62 : 42;
+   527→  }
+   528→  if (n > 0 && n <= 1) n = Math.round(n * 100); // 0.8 -> 80
+   529→  return Math.max(5, Math.min(99, Math.round(n)));
+   530→}
+   531→
+   532→function normalizeTime(v?: string): string {
+   533→  if (!v) return '';
+   534→  const s = String(v).trim();
+   535→  const m = s.match(/(\d{1,2}):(\d{2})/);
+   536→  if (m) {
+   537→    return `${m[1].padStart(2, '0')}:${m[2]}`;
+   538→  }
+   539→  return s.slice(0, 5);
+   540→}
+   541→
+   542→function normalizeOdds(v: unknown): string {
+   543→  let n = typeof v === 'number' ? v : parseFloat(String(v ?? ''));
+   544→  if (!isFinite(n) || n <= 1) return '—';
+   545→  return n.toFixed(2).replace('.', '.');
+   546→}
+   547→
+   548→async function searchWithRetry(
+   549→  zai: Awaited<ReturnType<typeof ZAI.create>>,
+   550→  query: string,
+   551→  num: number,
+   552→  retries = 3,
+   553→): Promise<unknown[]> {
+   554→  let lastError: unknown;
+   555→  for (let attempt = 1; attempt <= retries; attempt++) {
+   556→    try {
+   557→      // recency_days=1 — предпочитаем материалы за последние сутки,
+   558→      // чтобы отсечь старые новости о прошедших матчах
+   559→      const res = await zai.functions.invoke('web_search', {
+   560→        query,
+   561→        num,
+   562→        recency_days: 1,
+   563→      });
+   564→      bumpWebSearch();
+   565→      return (res as unknown[]) || [];
+   566→    } catch (e) {
+   567→      lastError = e;
+   568→      const msg = e instanceof Error ? e.message : String(e);
+   569→      const isRateLimit = msg.includes('429') || msg.includes('Too many');
+   570→      if (attempt < retries) {
+   571→        const delay = isRateLimit ? 1500 * attempt : 800 * attempt;
+   572→        await new Promise((r) => setTimeout(r, delay));
+   573→      }
+   574→    }
+   575→  }
+   576→  throw lastError;
+   577→}
+   578→
+   579→function todayRu(): {
+   580→  iso: string;
+   581→  pretty: string;
+   582→  weekday: string;
+   583→  ymd: string;
+   584→  timeMsk: string;
+   585→  year: number;
+   586→  month: number;
+   587→  day: number;
+   588→  monthName: string;
+   589→} {
+   590→  const now = new Date();
+   591→  const pretty = now.toLocaleDateString('ru-RU', {
+   592→    day: 'numeric',
+   593→    month: 'long',
+   594→    year: 'numeric',
+   595→    timeZone: 'Europe/Moscow',
+   596→  });
+   597→  const weekday = now.toLocaleDateString('ru-RU', {
+   598→    weekday: 'long',
+   599→    timeZone: 'Europe/Moscow',
+   600→  });
+   601→  const monthName = now.toLocaleDateString('ru-RU', {
+   602→    month: 'long',
+   603→    timeZone: 'Europe/Moscow',
+   604→  });
+   605→  // Локальные дата/время по Мск в формате YYYY-MM-DD и HH:MM
+   606→  const mskParts = new Intl.DateTimeFormat('en-CA', {
+   607→    timeZone: 'Europe/Moscow',
+   608→    year: 'numeric',
+   609→    month: '2-digit',
+   610→    day: '2-digit',
+   611→    hour: '2-digit',
+   612→    minute: '2-digit',
+   613→    hour12: false,
+   614→  }).formatToParts(now);
+   615→  const get = (t: string) =>
+   616→    mskParts.find((p) => p.type === t)?.value || '';
+   617→  const ymd = `${get('year')}-${get('month')}-${get('day')}`;
+   618→  const timeMsk = `${get('hour')}:${get('minute')}`;
+   619→  const year = parseInt(get('year'), 10);
+   620→  const month = parseInt(get('month'), 10);
+   621→  const day = parseInt(get('day'), 10);
+   622→  return { iso: now.toISOString(), pretty, weekday, ymd, timeMsk, year, month, day, monthName };
+   623→}
+   624→
+   625→// ====== АНТИ-ПРОШЕДШИЕ СОБЫТИЯ ======
+   626→// Слова-маркеры, указывающие, что матч уже завершился (а не предстоящий).
+   627→const PAST_MARKERS = [
+   628→  'выиграл', 'выиграла', 'выиграли',
+   629→  'победил', 'победила', 'победили',
+   630→  'обыграл', 'обыграли',
+   631→  'завершился', 'завершилась', 'завершили',
+   632→  'завершил', 'прошёл', 'прошла', 'прошли',
+   633→  'сыграл', 'сыграла', 'сыграли',
+   634→  'итог', 'итоги',
+   635→  'результат', 'результаты',
+   636→  'обзор', 'обзоры',
+   637→  'прошел сенсационно', 'сенсация',
+   638→  'выбыл', 'выбыла',
+   639→  'пройдет в', // иногда в обзорах «пройдет в 1/4» = уже состоялся
+   640→  'итоговый',
+   641→  'финал состоялся',
+   642→  'матч состоялся',
+   643→  'завершён', 'завершена', 'завершено',
+   644→  // английские маркеры (источники часто на англ.)
+   645→  'won', 'defeated', 'beat', 'finished',
+   646→  'congratulations', 'congrats',
+   647→  'crowned',
+   648→  'lifted the trophy',
+   649→  'eliminated',
+   650→  'knocked out',
+   651→  'стали чемпионами',
+   652→  'выиграли турнир',
+   653→  'завершили выступление',
+   654→  'вылетели',
+   655→];
+   656→
+   657→function hasPastMarker(text: string): { hit: boolean; marker: string | null } {
+   658→  const lower = (text || '').toLowerCase();
+   659→  for (const m of PAST_MARKERS) {
+   660→    if (lower.includes(m)) {
+   661→      return { hit: true, marker: m };
+   662→    }
+   663→  }
+   664→  return { hit: false, marker: null };
+   665→}
+   666→
+   667→// Проверка: время начала уже прошло по Мск?
+   668→function timeAlreadyPassed(startTime: string, currentTimeMsk: string): boolean {
+   669→  if (!startTime || !currentTimeMsk) return false;
+   670→  const sm = startTime.match(/^(\d{1,2}):(\d{2})$/);
+   671→  const cm = currentTimeMsk.match(/^(\d{1,2}):(\d{2})$/);
+   672→  if (!sm || !cm) return false;
+   673→  const sMin = parseInt(sm[1], 10) * 60 + parseInt(sm[2], 10);
+   674→  const cMin = parseInt(cm[1], 10) * 60 + parseInt(cm[2], 10);
+   675→  // Если матч начинается более чем на 30 минут раньше текущего времени — считаем прошедшим.
+   676→  // (даём буфер, чтобы не отсечь только что начавшиеся)
+   677→  return sMin + 30 < cMin;
+   678→}
+   679→
+   680→export interface GenerateOptions {
+   681→  force?: boolean;
+   682→}
+   683→
+   684→export interface GenerateResult {
+   685→  picks: Pick[];
+   686→  cached: boolean;
+   687→  date: string;
+   688→  usage: UsageStats;
+   689→  activeLeagues: ActiveLeagues;
+   690→  sportsSearched: number;
+   691→  filteredOut: number;
+   692→}
+   693→
+   694→export async function generateDailyPicks(
+   695→  opts: GenerateOptions = {},
+   696→): Promise<GenerateResult> {
+   697→  const { ymd: dayKey, pretty, weekday, timeMsk, year, month, day, monthName } = todayRu();
+   698→  const cacheKey = `picks-${dayKey}`;
+   699→  const active = getActiveLeagues(year, month);
+   700→
+   701→  const cached = cache.get(cacheKey);
+   702→  if (cached && !opts.force && Date.now() - cached.ts < CACHE_TTL) {
+   703→    usage.cacheHits += 1;
+   704→    // При отдаче из кэша отсекаем уже начавшиеся матчи.
+   705→    // Пики сгенерированы, скажем, в 10:00, а сейчас 18:00 — часть матчей уже прошла.
+   706→    // Не показываем их (статистику по ним сохраняем как есть, просто не отображаем).
+   707→    const livePicks = cached.picks.filter((p) => {
+   708→      // Для ESPN-пиков не применяем HH:MM-фильтр (они валидированы по UTC-дате).
+   709→      // ESPN-матч может быть в 01:40 МСК (ночь следующего дня) — HH:MM-сравнение
+   710→      // лочно посчитает его прошедшим.
+   711→      if (p.dataSource === 'ESPN API') return true;
+   712→      if (!p.startTime || !timeMsk) return true;
+   713→      return !timeAlreadyPassed(p.startTime, timeMsk);
+   714→    });
+   715→    return {
+   716→      picks: livePicks,
+   717→      cached: true,
+   718→      date: dayKey,
+   719→      usage: getUsage(),
+   720→      activeLeagues: active,
+   721→      sportsSearched: 0,
+   722→      filteredOut: 0,
+   723→    };
+   724→  }
+   725→
+   726→  // ====== DB FALLBACK: если кэш истёк/потерян (сервер перезапустился),
+   727→  // проверяем БД на сохранённые пики дня. Это гарантирует стабильность:
+   728→  // утренние пики не поменяются в обед при повторной генерации.
+   729→  if (!opts.force) {
+   730→    try {
+   731→      const { db } = await import('@/lib/db');
+   732→      const saved = await db.storedPick.findMany({
+   733→        where: { pickDate: dayKey },
+   734→        orderBy: { createdAt: 'asc' },
+   735→      });
+   736→      if (saved.length > 0) {
+   737→        // Конвертируем StoredPick → Pick (reasoning/risk/quote могут быть пустыми —
+   738→        // карточка покажет команды/рынок/коэф/уверенность, без анализа)
+   739→        const SPORT_ICONS_DB: Record<string, string> = {
+   740→          football: '⚽', basketball: '🏀', tennis: '🎾',
+   741→          hockey: '🏒', esports: '🎮', baseball: '⚾', volleyball: '🏐',
+   742→        };
+   743→        const dbPicks: Pick[] = saved.map((p) => ({
+   744→          id: p.id,
+   745→          sport: p.sport,
+   746→          sportKey: p.sportKey,
+   747→          sportIcon: SPORT_ICONS_DB[p.sportKey] || '🏆',
+   748→          league: p.league,
+   749→          team1: p.team1,
+   750→          team2: p.team2,
+   751→          startTime: p.startTime,
+   752→          market: p.market,
+   753→          selection: p.selection,
+   754→          odds: p.odds,
+   755→          confidence: p.confidence as Confidence,
+   756→          confidenceScore: p.confidenceScore,
+   757→          reasoning: '', // не хранится в БД
+   758→          risk: '',
+   759→          sourceQuote: '',
+   760→          sourceUrl: '',
+   761→          sourceName: '',
+   762→          dataSource: p.dataSource,
+   763→          generatedAt: p.createdAt.toISOString(),
+   764→        }));
+   765→        // Populate in-memory cache для следующих запросов
+   766→        cache.set(cacheKey, { picks: dbPicks, ts: Date.now() });
+   767→        usage.cacheHits += 1;
+   768→        // Отсекаем уже начавшиеся матчи
+   769→        const livePicks = dbPicks.filter((p) => {
+   770→          if (p.dataSource === 'ESPN API') return true;
+   771→          if (!p.startTime || !timeMsk) return true;
+   772→          return !timeAlreadyPassed(p.startTime, timeMsk);
+   773→        });
+   774→        console.log(
+   775→          `[picks] DB fallback: loaded ${dbPicks.length} picks from DB for ${dayKey}, ${livePicks.length} live`,
+   776→        );
+   777→        return {
+   778→          picks: livePicks,
+   779→          cached: true,
+   780→          date: dayKey,
+   781→          usage: getUsage(),
+   782→          activeLeagues: active,
+   783→          sportsSearched: 0,
+   784→          filteredOut: 0,
+   785→        };
+   786→      }
+   787→    } catch (e) {
+   788→      console.error('[picks] DB fallback failed:', e);
+   789→    }
+   790→  }
+   791→
+   792→  const zai = await ZAI.create();
+   793→  const SPORTS = buildSports(dayKey, year, month, day);
+   794→
+   795→  // Последовательный веб-поиск по видам спорта (с ретраями — чтобы не словить 429)
+   796→  // Для ЧМ и БШ-запросов берём больше результатов (8), для остальных — 6.
+   797→  const searchResults: { sport: (typeof SPORTS)[number]; results: unknown[] }[] =
+   798→    [];
+   799→  for (const sport of SPORTS) {
+   800→    const isPriorityQuery =
+   801→      sport.query.includes('чемпионат мира 2026') ||
+   802→      sport.query.includes('Australian Open') ||
+   803→      sport.query.includes('Roland Garros') ||
+   804→      sport.query.includes('Уимблдон') ||
+   805→      sport.query.includes('US Open');
+   806→    const num = isPriorityQuery ? 8 : 6;
+   807→    const results = await searchWithRetry(zai, sport.query, num).catch((e) => {
+   808→      console.error(`search failed for ${sport.key}:`, e);
+   809→      return [] as unknown[];
+   810→    });
+   811→    searchResults.push({ sport, results });
+   812→    // Небольшая пауза между запросами для соблюдения лимитов
+   813→    await new Promise((r) => setTimeout(r, 600));
+   814→  }
+   815→
+   816→  // Собираем контекст для LLM (с URL и host — для цитирования источников)
+   817→  let context = '';
+   818→  let sourceIdx = 0;
+   819→  for (const { sport, results } of searchResults) {
+   820→    const list = (results as unknown[]) || [];
+   821→    context += `\n\n=== ${sport.label.toUpperCase()} (${sport.icon}) ===\n`;
+   822→    if (list.length) {
+   823→      list.forEach((rRaw) => {
+   824→        sourceIdx += 1;
+   825→        const r = rRaw as {
+   826→          name?: string;
+   827→          snippet?: string;
+   828→          host_name?: string;
+   829→          url?: string;
+   830→          date?: string;
+   831→        };
+   832→        const dateStr = r.date ? ` | дата: ${r.date}` : '';
+   833→        context += `[ИСТОЧНИК #${sourceIdx}] ${r.name || ''}${dateStr}\nURL: ${r.url || '(нет)'}\nHOST: ${r.host_name || 'web'}\nТЕКСТ: ${r.snippet || ''}\n`;
+   834→      });
+   835→    } else {
+   836→      context += 'Данные из поиска недоступны.\n';
+   837→    }
+   838→  }
+   839→
+   840→  // ====== ТОЧНОЕ РАСПИСАНИЕ из ESPN API (без галлюцинаций) ======
+   841→  // Для ЧМ по футболу, WNBA, MLB — берём матчи напрямую из ESPN.
+   842→  // Эти матчи ГАРАНТИРОВАННО существуют и точны. LLM должна использовать их
+   843→  // как источник истины, а веб-поиск — только для дополнительного контекста.
+   844→  // ESPN требует дату в формате YYYYMMDD (без дефисов).
+   845→  let apiEvents: SportsEvent[] = [];
+   846→  try {
+   847→    const dateEspn = dayKey.replace(/-/g, '');
+   848→    const raw = await getTodayEventsFromApi(dateEspn);
+   849→    apiEvents = filterUpcoming(raw, timeMsk);
+   850→    console.log(
+   851→      `[picks] ESPN API events for ${dayKey} (espn=${dateEspn}): ${raw.length} total, ${apiEvents.length} upcoming`,
+   852→    );
+   853→  } catch (e) {
+   854→    console.error('[picks] ESPN API failed:', e);
+   855→  }
+   856→
+   857→  // Формируем блок точного расписания для LLM
+   858→  let apiScheduleText = '';
+   859→  if (apiEvents.length > 0) {
+   860→    apiScheduleText = `\n\n=== ТОЧНОЕ РАСПИСАНИЕ ИЗ ESPN API (ГАРАНТИРОВАННО АКТУАЛЬНО) ===\n`;
+   861→    apiScheduleText += `Эти матчи ТОЧНО состоятся сегодня (данные из ESPN API). Используй ИХ в первую очередь — для них НЕ нужен веб-поиск. Для каждого матча подбери рынок и коэффициент.\n\n`;
+   862→    apiEvents.forEach((ev, i) => {
+   863→      apiScheduleText += `[ESPN-${i + 1}] ${ev.sportIcon} ${ev.sportLabel} | ${ev.league}\n`;
+   864→      apiScheduleText += `  Матч: ${ev.team1} vs ${ev.team2}\n`;
+   865→      apiScheduleText += `  Время МСК: ${ev.startTimeMsk || '(не указано)'}\n`;
+   866→      apiScheduleText += `  Источник: ESPN API (точное расписание)\n`;
+   867→      apiScheduleText += `  Для этого пика в sourceQuote укажи: "ESPN API: ${ev.team1} vs ${ev.team2}, ${ev.startTimeMsk} МСК", sourceName: "ESPN API", dataSource: "ESPN API"\n\n`;
+   868→    });
+   869→  }
+   870→
+   871→  // ====== ВОЛЕЙБОЛ из API-Sports (бесплатный API) ======
+   872→  let volleyballEvents: VolleyballEvent[] = [];
+   873→  if (active.volleyball.length > 0) {
+   874→    try {
+   875→      const rawVb = await getVolleyballEvents(dayKey);
+   876→      volleyballEvents = filterUpcomingVolleyball(rawVb);
+   877→      console.log(
+   878→        `[picks] Volleyball API events for ${dayKey}: ${rawVb.length} total, ${volleyballEvents.length} upcoming`,
+   879→      );
+   880→      if (volleyballEvents.length > 0) {
+   881→        apiScheduleText += `\n=== ТОЧНОЕ РАСПИСАНИЕ ВОЛЕЙБОЛА ИЗ API-SPORTS ===\n`;
+   882→        apiScheduleText += `Эти матчи ТОЧНО состоятся сегодня (Лига наций и др.). Используй ИХ — для них НЕ нужен веб-поиск.\n\n`;
+   883→        volleyballEvents.forEach((ev, i) => {
+   884→          apiScheduleText += `[VB-${i + 1}] 🏐 Волейбол | ${ev.league}\n`;
+   885→          apiScheduleText += `  Матч: ${ev.team1} vs ${ev.team2}\n`;
+   886→          apiScheduleText += `  Время МСК: ${ev.startTimeMsk || '(не указано)'}\n`;
+   887→          apiScheduleText += `  Источник: API-Sports (точное расписание)\n`;
+   888→          apiScheduleText += `  Для этого пика в sourceQuote укажи: "API-Sports: ${ev.team1} vs ${ev.team2}, ${ev.startTimeMsk} МСК", sourceName: "API-Sports", dataSource: "API-Sports"\n\n`;
+   889→        });
+   890→      }
+   891→    } catch (e) {
+   892→      console.error('[picks] Volleyball API failed:', e);
+   893→    }
+   894→  }
+   895→
+   896→  // Вычисляем активный БШ-турнир ОДИН РАЗ — используется в промпте и постфильтре.
+   897→  const activeSlam = getActiveGrandSlam(year, month, day);
+   898→
+   899→  const seasonalityText = `АКТИВНЫЕ ТУРНИРЫ В ТЕКУЩЕМ МЕСЯЦЕ (${monthName} ${year}, месяц №${month}):
+   900→- Футбол: ${active.football.length ? active.football.join(', ') : 'НЕТ активных лиг — не включай футбол'}
+   901→- Баскетбол: ${active.basketball.length ? active.basketball.join(', ') : 'НЕТ активных лиг — не включай баскетбол'}
+   902→- Теннис: ${active.tennis.length ? active.tennis.join(', ') : 'НЕТ активных лиг — не включай теннис'}
+   903→- Хоккей: ${active.hockey.length ? active.hockey.join(', ') : 'НЕТ активных лиг — не включай хоккей'}
+   904→- Киберспорт: ${active.esports.length ? active.esports.join(', ') : 'НЕТ активных турниров — не включай киберспорт'}
+   905→- Волейбол: ${active.volleyball.length ? active.volleyball.join(', ') : 'НЕТ активных турниров — не включай волейбол'}
+   906→
+   907→ВНИМАНИЕ: многие лиги СЕЗОННЫЕ. Например, Бундеслига, АПЛ, Серия А, Ла Лига, КХЛ, НХЛ, Единая лига ВТБ, Евролига и НБА НЕ ИДУТ летом (июнь-август, а НХЛ/КХЛ до сентября). Евро УЕФА и Копа Америка проводятся раз в 4 года (2024, 2028) — в 2026 их НЕТ. Чемпионат мира по футболу — раз в 4 года (2022, 2026, 2030) — в ${year} году ${[2022, 2026, 2030, 2034].includes(year) ? 'ЧМ ИДЁТ — это главное событие, обязательно включай матчи ЧМ' : 'ЧМ не проводится'}. Если лига указана как активная выше — её можно использовать. Если лига НЕ указана в списке активных — КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО включать её матчи, даже если они упомянуты в источниках (вероятно, это старые обзоры или расписание прошлого сезона).`;
+   908→
+   909→  const systemPrompt = `Ты — спортивный аналитик. Твоя задача — ИЗВЛЕКАТЬ спортивные события из предоставленных источников веб-поиска и формировать пики для ставок.
+   910→
+   911→ГЛАВНОЕ ПРАВИЛО (НАРУШЕНИЕ = БРАК):
+   912→Ты НЕ генерируешь матчи по памяти. Ты ТОЛЬКО извлекаешь матчи, которые РЕАЛЬНО упомянуты в предоставленных источниках веб-поиска. Каждый пик ОБЯЗАН содержать:
+   913→- sourceQuote: ТОЧНАЯ цитата (фраза) из источника, где упомянуты ОБА участника ОДНОГО матча РЯДОМ друг с другом (с разделителем —, -, vs, против). Цитата должна быть дословной — копия фрагмента текста источника.
+   914→- sourceUrl: URL источника (из поля "URL:" в контексте).
+   915→- sourceName: host источника (из поля "HOST:" в контексте).
+   916→
+   917→Если ты не можешь найти в источниках конкретную фразу, упоминающую матч двух команд — НЕ ВКЛЮЧАЙ этот пик. Лучше 3 честных пика с цитатами, чем 10 выдуманных.
+   918→
+   919→АНТИ-ГАЛЛЮЦИНАЦИЯ:
+   920→- НЕ используй свои знания о расписании турниров прошлых лет.
+   921→- НЕ придумывай матчи «Барселона-Реал» или «Джокович-Алькарас» только потому, что знаешь эти имена.
+   922→- Если источник говорит «сегодня играют X и Y» — это валидный пик. Если источник говорит «турнир продолжается» без конкретики — НЕ придумывай матчи.
+   923→- Имена команд/игроков бери СТРОГО из текста источников. Не сокращай, не транслитерируй.
+   924→
+   925→АНТИ-CROSS-CONTAMINATION (КРИТИЧНО):
+   926→- НЕ спаривай игроков/команды из РАЗНЫХ матчей расписания. Если в источнике написано «14:30 Штруфф — Медведев» и отдельно «Кэм Норри — кто-то» — НЕ создавай пик «Штруфф vs Норри».
+   927→- sourceQuote ДОЛЖНА быть строкой, где team1 и team2 стоят РЯДОМ (между ними разделитель —, -, vs, против). Если в твоей цитате имена стоят в разных предложениях или далеко друг от друга — это неправильная пара.
+   928→- Перед формированием пика проверь: в sourceQuote team1 и team2 действительно играют МЕЖДУ СОБОЙ, а не просто оба упомянуты в статье.
+   929→
+   930→АНТИ-ПРОШЕДШИЕ (КРИТИЧНО):
+   931→- Если в источнике есть слова «выиграл», «победил», «обыграл», «завершился», «итог», «результат», «обзор», «прошёл», «чемпион», «финал состоялся», «congratulations», «winner» — ЭТО ПРОШЕДШИЙ МАТЧ. НЕ включай его как предстоящий.
+   932→- Если рядом с названием команд стоит СЧЁТ (например «Португалия — Хорватия 2:1», «ЮАР – Канада 0:1») — матч УЖЕ СОСТОЯЛСЯ. Не включай его.
+   933→- Если источник описывает, КТО ВЫИГРАЛ турнир или матч — это обзор завершённого события, а не расписание.
+   934→- ВАЛИДНОЕ расписание = команды + время, БЕЗ счёта. Например: «11:00 Австралия — Египет», «15:00 Аргентина — Кабо-Верде». Вот такие матчи включай.
+   935→- Включай ТОЛЬКО матчи, которые в источнике описаны как ПРЕДСТОЯЩИЕ (будут играть, сыграют, встретятся, расписание, матчи сегодня, без счёта).
+   936→- Если startTime задано и оно УЖЕ прошло (раньше текущего времени МСК, указано ниже) — не включай.
+   937→
+   938→ЧМ-2026 ИДЁТ СЕЙЧАС (главное событие):
+   939→- Чемпионат мира по футболу 2026 проходит 11 июня — 19 июля. Сегодня матчи 1/16 финала.
+   940→- ОБЯЗАТЕЛЬНО найди в источниках расписание матчей ЧМ на сегодня и включи их (те, что ещё не начались).
+   941→- Ищи в источниках фразы вида «HH:MM Команда1 — Команда2» без счёта — это расписание.
+   942→- Это приоритет №1 — если в источниках есть матчи ЧМ на сегодня, они ДОЛЖНЫ быть в ответе.
+   943→
+   944→ТУРНИР БОЛЬШОГО ШЛЕМА ИДЁТ (ОБЯЗАТЕЛЬНЫЙ ПИК):
+   945→- В текущем месяце идёт турнир Большого шлема (Australian Open / Roland Garros / Уимблдон / US Open).
+   946→- ОБЯЗАТЕЛЬНО включи МИНИМУМ 1 пик из этого турнира, если сегодня есть матчи (полуфиналы, финалы, и т.д.).
+   947→- Ищи в источниках расписание вида «HH:MM Игрок1 — Игрок2» (без счёта).
+   948→- Имена игроков бери СТРОГО из одной строки расписания. Не подставляй игроков из других матчей.
+   949→- Это приоритет №2 после ЧМ. Если БШ-турнир идёт, в ответе ДОЛЖЕН быть хотя бы 1 теннисный пик.
+   950→
+   951→ИСТОЧНИКИ ДАННЫХ (ПРИОРИТЕТ):
+   952→1. ESPN API — если в контексте есть блок «ТОЧНОЕ РАСПИСАНИЕ ИЗ ESPN API», используй ИСКЛЮЧИТЕЛЬНО эти матчи для соответствующих видов спорта (ЧМ, WNBA, MLB). НЕ ищи их в веб-поиске — они уже точные. Для каждого ESPN-матча подбери рынок/коэффициент и обязательно укажи dataSource="ESPN API".
+   953→2. Веб-поиск — для турниров, которых НЕТ в ESPN (теннис БШ, киберспорт). Извлекай матчи по правилам ниже.
+   954→
+   955→ПРИОРИТЕТЫ:
+   956→- Чемпионат мира по футболу (если идёт) — главное событие. Берётся из ESPN API.
+   957→- Турнир Большого шлема (если идёт) — ОБЯЗАТЕЛЬНО минимум 1 пик. Берётся из веб-поиска.
+   958→- WNBA — ОБЯЗАТЕЛЬНО минимум 1 пик, если сегодня есть матчи в ESPN API. Берётся из ESPN API.
+   959→- MLB — из ESPN API.
+   960→- Волейбол (Лига наций) — ОБЯЗАТЕЛЬНО минимум 1 пик, если в сезоне Лига наций. Берётся из веб-поиска. Ищи расписание матчей сегодня (мужчины и женщины).
+   961→- Киберспорт — ТОЛЬКО топовые турниры (Majors, IEM, Worlds, TI, VCT Champions). Если в источниках нет конкретного сегодняшнего кибер-матча — не включай киберспорт.
+   962→
+   963→ВАЛИДАЦИЯ ЛИГИ (КРИТИЧНО):
+   964→- sport и league ДОЛЖНЫ соответствовать друг другу. Примеры правильных пар:
+   965→  • sport="Теннис" → league="Уимблдон" / "Roland Garros" / "ATP" / "WTA"
+   966→  • sport="Баскетбол" → league="WNBA" / "Летняя лига НБА" / "НБА"
+   967→  • sport="Футбол" → league="Чемпионат мира по футболу" / "АПЛ" / "Лига чемпионов УЕФА"
+   968→  • sport="Бейсбол" → league="MLB"
+   969→- НЕВЕРНО: sport="Футбол" с league="Уимблдон" (Уимблдон — это теннис!).
+   970→- НЕВЕРНО: sport="Теннис" с league="WNBA" (WNBA — это баскетбол!).
+   971→- Если сомневаешься в виде спорта турнира — не включай его.
+   972→
+   973→АНТИ-АРХИВ-БШ (КРИТИЧНО):
+   974→- Если в контексте выше НЕ указано «Сейчас идёт турнир Большого шлема — {имя}» — значит БШ-турнир СЕЙЧАС НЕ ИДЁТ.
+   975→- В этом случае КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО использовать лиги "Уимблдон", "Roland Garros", "Australian Open", "US Open".
+   976→- Если веб-поиск нашёл страницу с прошлым матчем БШ-турнира (например «Синнер-Кецманович Wimbledon 2026») — это АРХИВ прошлой встречи. Не создавай пик по нему.
+   977→- Вместо БШ-имени используй РЕАЛЬНЫЙ турнир сегодня: ATP 250, ATP 500, WTA 250 и т.д. (например «ATP Умаг», «ATP Бастад», «ATP Гштаад»).
+   978→${activeSlam ? `- СЕЙЧАС ИДЁТ БШ: ${activeSlam}. Только для него можно использовать это имя в league.` : `- СЕЙЧАС БШ НЕ ИДЁТ. НЕ используй имена БШ-турниров в league. Используй ATP/WTA + название города/турнира.`}
+   979→
+   980→КОЛИЧЕСТВО И КАЧЕСТВО (ВАЖНО):
+   981→- Отбирай 3-6 ЛУЧШИХ пиков на день, а не все возможные. Качество важнее количества.
+   982→- Предпочитай пики с высокой уверенностью (confidence=high).
+   983→- Не включай 2 пика на один и тот же матч (разные рынки) — выбери один самый уверенный.
+   984→- Если сомневаешься в матче — не включай его. Лучше 3 чётких пика, чем 6 сомнительных.
+   985→
+   986→${seasonalityText}
+   987→
+   988→ФОРМАТ JSON (СТРОГО, без markdown):
+   989→Каждый объект:
+   990→{
+   991→  "sport": "Футбол|Баскетбол|Теннис|Хоккей|Киберспорт|Бейсбол|Волейбол",
+   992→  "league": "турнир из списка активных",
+   993→  "team1": "команда/игрок 1 (из источника)",
+   994→  "team2": "команда/игрок 2 (из источника)",
+   995→  "time": "HH:MM по Мск или пусто",
+   996→  "market": "рынок ставки",
+   997→  "selection": "выбор",
+   998→  "odds": число 1.10-15.0 (типичный для рынка; 1.90 для тотала, 1.75 для фаворита),
+   999→  "confidence": "low|medium|high",
+  1000→  "confidenceScore": 5-99,
+  1001→  "reasoning": "анализ 1-3 предложения",
+  1002→  "risk": "риск",
+  1003→  "sourceQuote": "ТОЧНАЯ цитата из источника с упоминанием матча/команд",
+  1004→  "sourceUrl": "URL источника",
+  1005→  "sourceName": "host источника",
+  1006→  "dataSource": "ESPN API" (если матч из ESPN-блока) ИЛИ "Веб-поиск" (если из веб-поиска)
+  1007→}
+  1008→
+  1009→Если по виду спорта нет валидных матчей в источниках — не включай его. Верни только JSON-массив.`;
+  1010→
+  1011→  const slamInstruction = activeSlam
+  1012→    ? `\n\nВАЖНО: Сейчас идёт турнир Большого шлема — ${activeSlam}. В ответе ОБЯЗАТЕЛЬНО должен быть МИНИМУМ 1 теннисный пик из ${activeSlam}, если в источниках есть матчи на сегодня (ещё не начавшиеся к ${timeMsk} МСК). Ищи в источниках расписание вида "HH:MM Игрок1 — Игрок2".`
+  1013→    : '';
+  1014→
+  1015→  // Есть ли WNBA-матчи сегодня? Если да — пик обязателен.
+  1016→  const hasWnba = apiEvents.some((e) => e.sportKey === 'basketball' && e.league === 'WNBA');
+  1017→  const wnbaInstruction = hasWnba
+  1018→    ? `\n\nВАЖНО: Сегодня есть матчи WNBA (женский баскетбол) в ESPN API. В ответе ОБЯЗАТЕЛЬНО должен быть МИНИМУМ 1 пик по WNBA.`
+  1019→    : '';
+  1020→
+  1021→  // Идёт ли Лига наций по волейболу? Если да — пик обязателен.
+  1022→  const hasVolleyball = active.volleyball.length > 0;
+  1023→  const volleyballInstruction = hasVolleyball
+  1024→    ? `\n\nВАЖНО: Сейчас идёт Лига наций по волейболу (мужчины и женщины). В ответе ОБЯЗАТЕЛЬНО должен быть МИНИМУМ 1 пик по волейболу, если в источниках есть матчи на сегодня.`
+  1025→    : '';
+  1026→
+  1027→  const userPrompt = `Сегодня: ${weekday}, ${pretty}. Время по Мск: ${timeMsk}. Дата YYYY-MM-DD: ${dayKey}.${slamInstruction}${wnbaInstruction}${volleyballInstruction}
+  1028→
+  1029→Стратегия:
+  1030→1. СНАЧАЛА используй матчи из блока «ТОЧНОЕ РАСПИСАНИЕ ИЗ ESPN API» (ниже) — это гарантированно точные матчи ЧМ/WNBA/MLB. Для них НЕ нужен веб-поиск.
+  1031→2. ДЛЯ ТЕННИСА/КИБЕРСПОРТА/ВОЛЕЙБОЛА — извлекай матчи из веб-поиска по правилам выше. ${activeSlam ? `Особое внимание — ${activeSlam}: МИНИМУМ 1 пик обязателен.` : ''}${hasVolleyball ? ' Волейбол (Лига наций): МИНИМУМ 1 пик обязателен.' : ''}
+  1032→
+  1033→${apiScheduleText}
+  1034→
+  1035→=== ВЕБ-ПОИСК (для тенниса, киберспорта и др.) ===
+  1036→${context}
+  1037→
+  1038→Верни JSON-массив пиков. Для ESPN-матчей: dataSource="ESPN API", sourceName="ESPN API". Для веб-поиска: dataSource="Веб-поиск". Не выдумывай матчи.${activeSlam ? ` Помни: пик из ${activeSlam} ОБЯЗАТЕЛЕН.` : ''}${hasWnba ? ` Помни: пик по WNBA ОБЯЗАТЕЛЕН.` : ''}${hasVolleyball ? ` Помни: пик по волейболу ОБЯЗАТЕЛЕН.` : ''}`;
+  1039→
+  1040→  let content = '[]';
+  1041→  try {
+  1042→    const completion = await zai.chat.completions.create({
+  1043→      messages: [
+  1044→        { role: 'assistant', content: systemPrompt },
+  1045→        { role: 'user', content: userPrompt },
+  1046→      ],
+  1047→      thinking: { type: 'disabled' },
+  1048→    });
+  1049→    bumpLLM();
+  1050→    content = completion.choices[0]?.message?.content || '[]';
+  1051→  } catch (e) {
+  1052→    console.error('LLM call failed:', e);
+  1053→    return {
+  1054→      picks: cached?.picks ?? [],
+  1055→      cached: !!cached,
+  1056→      date: dayKey,
+  1057→      usage: getUsage(),
+  1058→      activeLeagues: active,
+  1059→      sportsSearched: SPORTS.length,
+  1060→      filteredOut: 0,
+  1061→    };
+  1062→  }
+  1063→
+  1064→  const generatedAt = new Date().toISOString();
+  1065→  const allPicks = parsePicks(content, generatedAt, dayKey);
+  1066→
+  1067→  // Постфильтр: дополнительно отсекаем пики по лигам, не активным в текущем
+  1068→  // месяце (на случай, если LLM всё же включила КХЛ в июле и т.п.)
+  1069→  const allowedBySport: Record<string, string[]> = {
+  1070→    football: active.football,
+  1071→    basketball: active.basketball,
+  1072→    tennis: active.tennis,
+  1073→    hockey: active.hockey,
+  1074→    esports: active.esports,
+  1075→    volleyball: active.volleyball,
+  1076→    baseball: active.baseball || ['MLB'],
+  1077→  };
+  1078→  const picks: Pick[] = [];
+  1079→  let filteredOut = 0;
+  1080→  for (const p of allPicks) {
+  1081→    const allowed = allowedBySport[p.sportKey] || [];
+  1082→    const isFromApi = p.dataSource === 'ESPN API' || p.dataSource === 'API-Sports';
+  1083→
+  1084→    // Проверка 0 (ВАЛИДАЦИЯ СПОРТ↔ЛИГА): отлов mismatches вида «Футбол + Уимблдон».
+  1085→    // Если в лиге явно указан турнир другого вида спорта — отбраковываем.
+  1086→    const leagueLower = (p.league || '').toLowerCase();
+  1087→    const WRONG_LEAGUE_FOR_SPORT: Record<string, string[]> = {
+  1088→      football: ['уимблдон', 'roland garros', 'australian open', 'us open', 'wnba', 'mlb', 'nba', 'нхл', 'кхл', 'iem', 'lol', 'лига наций волейбол'],
+  1089→      basketball: ['уимблдон', 'roland garros', 'australian open', 'us open', 'mlb', 'чемпионат мира по футболу', 'чм-2026', 'апл', 'ла лига', 'iem', 'лига наций волейбол'],
+  1090→      tennis: ['wnba', 'mlb', 'nba', 'нхл', 'кхл', 'чемпионат мира по футболу', 'чм-2026', 'апл', 'iem', 'lol', 'лига наций волейбол'],
+  1091→      hockey: ['уимблдон', 'wnba', 'mlb', 'nba', 'чемпионат мира по футболу', 'iem', 'лига наций волейбол'],
+  1092→      esports: ['уимблдон', 'roland garros', 'wnba', 'mlb', 'nba', 'нхл', 'кхл', 'чемпионат мира по футболу', 'апл', 'ла лига', 'лига наций волейбол'],
+  1093→      baseball: ['уимблдон', 'roland garros', 'wnba', 'nba', 'нхл', 'кхл', 'чемпионат мира по футболу', 'апл', 'iem', 'лига наций волейбол'],
+  1094→      volleyball: ['уимблдон', 'roland garros', 'wnba', 'mlb', 'nba', 'нхл', 'кхл', 'чемпионат мира по футболу', 'апл', 'iem'],
+  1095→    };
+  1096→    const wrongLeagues = WRONG_LEAGUE_FOR_SPORT[p.sportKey] || [];
+  1097→    const isWrongLeague = wrongLeagues.some((wl) => leagueLower.includes(wl));
+  1098→    if (isWrongLeague) {
+  1099→      filteredOut += 1;
+  1100→      console.warn(
+  1101→        `[picks] filtered out (wrong league for sport): sport=${p.sportKey}, league=${p.league} (${p.team1} vs ${p.team2})`,
+  1102→      );
+  1103→      continue;
+  1104→    }
+  1105→
+  1106→    // Проверка 0b (АНТИ-УИМБЛДОН-ПОСЛЕ-ЗАВЕРШЕНИЯ):
+  1107→    // Если БШ-турнир НЕ активен сейчас, а лига содержит имя БШ — это галлюцинация
+  1108→    // (LLM нашла архив результатов и лепит БШ-имя на текущий ATP-матч).
+  1109→    // Отбраковываем такие пики.
+  1110→    const SLAM_NAMES = ['уимблдон', 'wimbledon', 'roland garros', 'australian open', 'us open'];
+  1111→    const leagueHasSlam = SLAM_NAMES.some((s) => leagueLower.includes(s));
+  1112→    if (leagueHasSlam && !activeSlam) {
+  1113→      filteredOut += 1;
+  1114→      console.warn(
+  1115→        `[picks] filtered out (slam league when no slam active): league=${p.league} (${p.team1} vs ${p.team2}) — slam=${activeSlam || 'NONE'}`,
+  1116→      );
+  1117→      continue;
+  1118→    }
+  1119→
+  1120→    // Проверка 1: лига должна быть активной в текущем сезоне
+  1121→    // (для ESPN-матчей ЧМ/MLB/WNBA это автоматически проходит, т.к. они уже
+  1122→    // отфильтрованы по сезонности на этапе getActiveLeagues + ESPN endpoint)
+  1123→    if (!isLeagueAllowed(p.league, allowed) && !isFromApi) {
+  1124→      filteredOut += 1;
+  1125→      console.warn(
+  1126→        `[picks] filtered out off-season league: ${p.sport}/${p.league} (${p.team1} vs ${p.team2})`,
+  1127→      );
+  1128→      continue;
+  1129→    }
+  1130→
+  1131→    // Проверка 2 (АНТИ-ГАЛЛЮЦИНАЦИЯ + АНТИ-CROSS-CONTAMINATION):
+  1132→    // Для веб-поиска: sourceQuote обязан содержать оба имени РЯДОМ (≤60 символов).
+  1133→    // Для ESPN API-матчей: цитата формируется программно, проверка не нужна.
+  1134→    if (!isFromApi) {
+  1135→      const quote = (p.sourceQuote || '').toLowerCase().trim();
+  1136→      const t1 = (p.team1 || '').toLowerCase().trim();
+  1137→      const t2 = (p.team2 || '').toLowerCase().trim();
+  1138→      const t1Parts = t1.split(/\s+/).filter((s) => s.length >= 4);
+  1139→      const t2Parts = t2.split(/\s+/).filter((s) => s.length >= 4);
+  1140→
+  1141→      const t1Positions: number[] = [];
+  1142→      const t2Positions: number[] = [];
+  1143→      for (const part of t1Parts) {
+  1144→        let idx = quote.indexOf(part);
+  1145→        while (idx !== -1) {
+  1146→          t1Positions.push(idx);
+  1147→          idx = quote.indexOf(part, idx + 1);
+  1148→        }
+  1149→      }
+  1150→      for (const part of t2Parts) {
+  1151→        let idx = quote.indexOf(part);
+  1152→        while (idx !== -1) {
+  1153→          t2Positions.push(idx);
+  1154→          idx = quote.indexOf(part, idx + 1);
+  1155→        }
+  1156→      }
+  1157→
+  1158→      const bothPresent = t1Positions.length > 0 && t2Positions.length > 0;
+  1159→      let minDistance = Infinity;
+  1160→      if (bothPresent) {
+  1161→        for (const a of t1Positions) {
+  1162→          for (const b of t2Positions) {
+  1163→            minDistance = Math.min(minDistance, Math.abs(a - b));
+  1164→          }
+  1165→        }
+  1166→      }
+  1167→      const namesClose = minDistance <= 60;
+  1168→
+  1169→      if (!quote || quote.length < 15 || !bothPresent || !namesClose) {
+  1170→        filteredOut += 1;
+  1171→        console.warn(
+  1172→          `[picks] filtered out (no valid sourceQuote or names too far apart: dist=${minDistance}): ${p.sport}/${p.league} (${p.team1} vs ${p.team2}) — quote="${p.sourceQuote?.slice(0, 80)}"`,
+  1173→        );
+  1174→        continue;
+  1175→      }
+  1176→    } else {
+  1177→      // Для ESPN-матчей: источник уже валиден, но проверим что пик
+  1178→      // соответствует одному из полученных из API событий.
+  1179→      // Используем мягкое совпадение: хотя бы по 4 символам каждого имени.
+  1180→      const norm = (s: string) => s.toLowerCase().replace(/[^a-zа-яё0-9]/gi, '');
+  1181→      const p1 = norm(p.team1);
+  1182→      const p2 = norm(p.team2);
+  1183→      const matchInApi = apiEvents.some((ev) => {
+  1184→        const e1 = norm(ev.team1);
+  1185→        const e2 = norm(ev.team2);
+  1186→        // Проверяем в обе стороны (home/away могут быть перепутаны)
+  1187→        const direct =
+  1188→          (e1.includes(p1.slice(0, 4)) || p1.includes(e1.slice(0, 4))) &&
+  1189→          (e2.includes(p2.slice(0, 4)) || p2.includes(e2.slice(0, 4)));
+  1190→        const swapped =
+  1191→          (e2.includes(p1.slice(0, 4)) || p1.includes(e2.slice(0, 4))) &&
+  1192→          (e1.includes(p2.slice(0, 4)) || p2.includes(e1.slice(0, 4)));
+  1193→        return direct || swapped;
+  1194→      });
+  1195→      if (!matchInApi) {
+  1196→        filteredOut += 1;
+  1197→        console.warn(
+  1198→          `[picks] filtered out (ESPN pick not in API events): ${p.sport}/${p.league} (${p.team1} vs ${p.team2})`,
+  1199→        );
+  1200→        continue;
+  1201→      }
+  1202→    }
+  1203→
+  1204→    // Проверка 3 (АНТИ-ПРОШЕДШИЕ): если в sourceQuote или reasoning
+  1205→    // есть слова-маркеры прошедшего матча («выиграла», «завершился» и т.п.)
+  1206→    // — отбраковываем. Это решает случай «Team Falcons выиграла IEM Major».
+  1207→    const pastCheck = hasPastMarker(p.sourceQuote + ' ' + p.reasoning + ' ' + p.risk);
+  1208→    if (pastCheck.hit) {
+  1209→      filteredOut += 1;
+  1210→      console.warn(
+  1211→        `[picks] filtered out (past event, marker="${pastCheck.marker}"): ${p.sport}/${p.league} (${p.team1} vs ${p.team2}) — quote="${p.sourceQuote?.slice(0, 80)}"`,
+  1212→      );
+  1213→      continue;
+  1214→    }
+  1215→
+  1216→    // Проверка 3b: если в sourceQuote есть счёт матча (паттерн «цифра:цифра»
+  1217→    // или «цифра - цифра» рядом с командами) — это уже сыгранный матч.
+  1218→    {
+  1219→      // Исключаем время HH:MM (например "13:00"). Убираем без \b, чтобы чистить
+  1220→      // и слитые с годом/датой варианты вида "03.07.2611:00" (= дата 03.07.26 + 11:00).
+  1221→      // Время всегда имеет 2 цифры после двоеточия; счёт часто с 1 цифрой (2:1).
+  1222→      const withoutTime = p.sourceQuote.replace(/\d{1,2}:\d{2}/g, '');
+  1223→      if (/\d{1,2}\s*[:\-–]\s*\d{1,2}/.test(withoutTime)) {
+  1224→        filteredOut += 1;
+  1225→        console.warn(
+  1226→          `[picks] filtered out (has score in quote = past match): ${p.sport}/${p.league} (${p.team1} vs ${p.team2}) — quote="${p.sourceQuote?.slice(0, 80)}"`,
+  1227→        );
+  1228→        continue;
+  1229→      }
+  1230→    }
+  1231→
+  1232→    // Проверка 4: если startTime задано и уже прошло по Мск (с буфером 30 мин) — отбраковываем.
+  1233→    // ВАЖНО: для ESPN-пиков эту проверку пропускаем — они уже отфильтрованы в filterUpcoming
+  1234→    // по полной UTC-дате. ESPN-матч может быть в 01:40 МСК (ночь следующего дня), и простое
+  1235→    // сравнение HH:MM ложно посчитает его прошедшим.
+  1236→    if (!isFromApi && timeAlreadyPassed(p.startTime, timeMsk)) {
+  1237→      filteredOut += 1;
+  1238→      console.warn(
+  1239→        `[picks] filtered out (time already passed: start=${p.startTime}, now=${timeMsk}): ${p.sport}/${p.league} (${p.team1} vs ${p.team2})`,
+  1240→      );
+  1241→      continue;
+  1242→    }
+  1243→
+  1244→    // Если LLM не выдала коэффициент — ставим нейтральный дефолт
+  1245→    if (!p.odds || p.odds === '—') {
+  1246→      p.odds = '1.90';
+  1247→    }
+  1248→    picks.push(p);
+  1249→  }
+  1250→
+  1251→  // Дедупликация: если несколько пиков на один матч (team1+team2+startTime),
+  1252→  // оставляем только первый.
+  1253→  const seen = new Set<string>();
+  1254→  const deduped: Pick[] = [];
+  1255→  for (const p of picks) {
+  1256→    const key = `${p.sportKey}|${p.team1.toLowerCase()}|${p.team2.toLowerCase()}|${p.startTime}`.toLowerCase();
+  1257→    if (seen.has(key)) {
+  1258→      filteredOut += 1;
+  1259→      continue;
+  1260→    }
+  1261→    seen.add(key);
+  1262→    deduped.push(p);
+  1263→  }
+  1264→
+  1265→  if (deduped.length > 0) {
+  1266→    cache.set(cacheKey, { picks: deduped, ts: Date.now() });
+  1267→    usage.generations += 1;
+  1268→  }
+  1269→
+  1270→  // Сохраняем пики в БД для ведения статистики (не блокируя ответ).
+  1271→  // Это бесплатно — никаких API-вызовов, только локальная SQLite.
+  1272→  savePicksToDb(deduped, dayKey).catch((e) =>
+  1273→    console.error('[picks] savePicksToDb failed:', e),
+  1274→  );
+  1275→
+  1276→  return {
+  1277→    picks: deduped,
+  1278→    cached: false,
+  1279→    date: dayKey,
+  1280→    usage: getUsage(),
+  1281→    activeLeagues: active,
+  1282→    sportsSearched: SPORTS.length,
+  1283→    filteredOut,
+  1284→  };
+  1285→}
+  1286→
